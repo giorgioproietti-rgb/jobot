@@ -1,5 +1,7 @@
 # Jobot — Agente intelligente per la ricerca di lavoro
 
+> https://github.com/giorgioproietti-rgb/jobot
+
 Bot Telegram (@gg_job_bot) che analizza il tuo CV e valuta le offerte di lavoro usando Claude AI.
 Tutto locale: nessun cloud, nessuna configurazione complessa. Solo un database SQLite sul tuo PC.
 
