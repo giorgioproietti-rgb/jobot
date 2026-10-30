@@ -1222,21 +1222,26 @@ async def cmd_analisi_cv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     system = (
         "Sei un career coach esperto del mercato del lavoro italiano. "
-        "Analizza il CV rispetto alle offerte di mercato e ai dati degli osservatori italiani (Excelsior, ISTAT, Sole24Ore). "
+        "Analizza il CV rispetto al mercato generale del ruolo specificato in Italia. "
+        "IMPORTANTE: lo score e la RAL devono riflettere il mercato GENERALE italiano per quel ruolo, "
+        "non le offerte specifiche fornite (che potrebbero essere non pertinenti). "
+        "Usa la tua conoscenza del mercato italiano + i dati degli osservatori forniti. "
         "Rispondi SOLO con JSON valido, nessun testo fuori:\n"
         '{"score_mercato":"X%",'
+        '"score_spiegazione":"2-3 frasi: cosa significa questo score, su cosa si basa (seniority, skill, domanda di mercato) e cosa implica per la carriera",'
+        '"ral_range":"es. 35.000–55.000€",'
+        '"ral_spiegazione":"2-3 frasi: contesto RAL per questo ruolo in Italia, variazioni per settore/città/seniority, confronto con il profilo del candidato",'
         '"forze":["punto di forza 1","punto di forza 2","punto di forza 3"],'
         '"lacune":["skill mancante 1","skill mancante 2","skill mancante 3"],'
         '"keywords_ats":["keyword1","keyword2","keyword3","keyword4","keyword5"],'
-        '"trend":"2-3 frasi sui trend di mercato per questo ruolo in Italia",'
-        '"azioni_30gg":["azione concreta 1","azione concreta 2","azione concreta 3"],'
-        '"ral_range":"es. 35.000–55.000€"}'
+        '"trend":"2-3 frasi sui trend del ruolo in Italia: domanda, settori in crescita, tecnologie richieste",'
+        '"azioni_30gg":["azione concreta 1","azione concreta 2","azione concreta 3"]}'
     )
     user_content = (
         f"RUOLO TARGET: {role}\n\n"
         f"CV (estratto):\n{cv_text[:2000]}\n\n"
-        f"OFFERTE DI MERCATO ({num_offers} trovate, mostra 6):\n{offers_text[:3000]}\n\n"
-        f"DATI OSSERVATORI ITALIANI:\n{insights_text}"
+        f"OFFERTE TROVATE ({num_offers}, usa solo come contesto secondario):\n{offers_text[:2000]}\n\n"
+        f"DATI OSSERVATORI ITALIANI (priorità alta per score e trend):\n{insights_text}"
     )
 
     raw = await loop.run_in_executor(None, _call_groq, system, user_content, 700)
@@ -1247,37 +1252,54 @@ async def cmd_analisi_cv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         data = json.loads(raw[start:end])
     except Exception:
         data = {
-            "score_mercato": "N/D", "forze": [], "lacune": [], "keywords_ats": [],
-            "trend": raw[:300], "azioni_30gg": [], "ral_range": "N/D",
+            "score_mercato": "N/D", "score_spiegazione": "",
+            "ral_range": "N/D", "ral_spiegazione": "",
+            "forze": [], "lacune": [], "keywords_ats": [],
+            "trend": raw[:300], "azioni_30gg": [],
         }
 
-    score    = data.get("score_mercato", "N/D")
+    score             = data.get("score_mercato", "N/D")
+    score_spiegazione = data.get("score_spiegazione", "")
+    ral_range         = data.get("ral_range", "N/D")
+    ral_spiegazione   = data.get("ral_spiegazione", "")
     forze    = data.get("forze", [])
     lacune   = data.get("lacune", [])
     keywords = data.get("keywords_ats", [])
     trend    = data.get("trend", "")
     azioni   = data.get("azioni_30gg", [])
-    ral_range = data.get("ral_range", "N/D")
 
-    forze_block    = "\n".join(f"  ✅ {f}" for f in forze)    if forze    else "  N/D"
-    lacune_block   = "\n".join(f"  ⚠️ {l}" for l in lacune)   if lacune   else "  Nessuna lacuna rilevante"
+    forze_block    = "\n".join(f"  ✅ {f}" for f in forze)  if forze  else "  N/D"
+    lacune_block   = "\n".join(f"  ⚠️ {l}" for l in lacune) if lacune else "  Nessuna lacuna rilevante"
     keywords_block = " · ".join(f"<code>{k}</code>" for k in keywords) if keywords else "N/D"
     azioni_block   = "\n".join(f"  {i+1}. {a}" for i, a in enumerate(azioni)) if azioni else "  N/D"
 
-    sources_used = list({item.get("source", "") for item in insights if item.get("source")})
-    sources_note = f"\n\n<i>📚 Fonti osservatori: {', '.join(sources_used)}</i>" if sources_used else ""
+    # Fonti osservatori con link
+    sources_lines = []
+    seen_sources: set[str] = set()
+    for item in insights[:5]:
+        src = item.get("source", "")
+        url = item.get("url", "")
+        if src and src not in seen_sources:
+            seen_sources.add(src)
+            sources_lines.append(f'<a href="{url}">{src}</a>' if url else src)
+    sources_block = "  📚 <i>Fonti: " + " · ".join(sources_lines) + "</i>" if sources_lines else ""
+
+    score_block = f"\n<i>{score_spiegazione}</i>" if score_spiegazione else ""
+    ral_block   = f"\n<i>{ral_spiegazione}</i>"   if ral_spiegazione   else ""
 
     msg = (
         f"🔬 <b>ANALISI CV vs MERCATO — {role.upper()}</b>\n\n"
-        f"📊 <b>Score di mercato:</b> {score}\n"
-        f"💰 <b>Range RAL di mercato:</b> {ral_range}\n"
-        f"🔢 Offerte analizzate: {num_offers}\n\n"
-        f"✅ <b>I tuoi punti di forza:</b>\n{forze_block}\n\n"
+        f"📊 <b>Score di mercato: {score}</b>{score_block}\n\n"
+        f"💰 <b>Range RAL: {ral_range}</b>{ral_block}\n\n"
+        f"🔢 Offerte di riferimento: {num_offers}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ <b>Punti di forza:</b>\n{forze_block}\n\n"
         f"⚠️ <b>Lacune da colmare:</b>\n{lacune_block}\n\n"
-        f"🔑 <b>Keyword ATS da inserire nel CV:</b>\n{keywords_block}\n\n"
-        f"📈 <b>Trend di mercato:</b>\n  {trend}\n\n"
+        f"🔑 <b>Keyword ATS per il CV:</b>\n{keywords_block}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 <b>Trend di mercato:</b>\n  {trend}\n"
+        f"{sources_block}\n\n"
         f"⚡ <b>Piano d'azione 30 giorni:</b>\n{azioni_block}"
-        f"{sources_note}"
     )
     await progress.edit_text(msg, parse_mode="HTML")
 
