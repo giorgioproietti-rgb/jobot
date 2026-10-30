@@ -257,6 +257,46 @@ def fetch_linkedin(query: str, location: str, email: str, password: str) -> list
 
 
 # ---------------------------------------------------------------------------
+# Osservatori mercato del lavoro italiano
+# ---------------------------------------------------------------------------
+
+def fetch_market_insights(role: str) -> list[dict]:
+    """Articoli e dati di mercato da osservatori italiani (ANSA, Sole24Ore, Excelsior)."""
+    sources = [
+        ("ANSA Lavoro",    "https://www.ansa.it/sito/notizie/economia/lavoro/lavoro_rss.xml"),
+        ("Il Sole 24 Ore", "https://www.ilsole24ore.com/rss/lavoro.xml"),
+        ("Excelsior",      "https://excelsior.unioncamere.net/rss"),
+    ]
+    market_terms = {"mercato lavoro", "occupazione", "stipendi", "retribuz", "assunzioni", "lavoro", "skill"}
+    keywords = [w.lower() for w in role.split() if len(w) > 3]
+    results = []
+
+    for source_name, url in sources:
+        try:
+            content = _get(url)
+            feed = feedparser.parse(content)
+            for entry in feed.entries[:20]:
+                title = entry.get("title", "")
+                summary = entry.get("summary", "")
+                combined = (title + " " + summary).lower()
+                role_match = any(kw in combined for kw in keywords)
+                market_match = any(t in combined for t in market_terms)
+                if not role_match and not market_match:
+                    continue
+                results.append({
+                    "title": title.strip(),
+                    "description": summary[:400],
+                    "url": entry.get("link", ""),
+                    "source": source_name,
+                })
+        except Exception as e:
+            log.warning("%s insights error: %s", source_name, e)
+
+    log.info("Market insights: %d articoli per '%s'", len(results), role)
+    return results[:10]
+
+
+# ---------------------------------------------------------------------------
 # Helpers pubblici
 # ---------------------------------------------------------------------------
 
