@@ -1,0 +1,4 @@
+app = "jobot-tgbot"
+primary_region = "cdg"
+
+[build]
