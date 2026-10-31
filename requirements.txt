@@ -1,5 +1,7 @@
-python-telegram-bot==21.6
+python-telegram-bot[job-queue]==21.6
+asyncpg
 groq
 pypdf
 feedparser
 linkedin-api
+httpx

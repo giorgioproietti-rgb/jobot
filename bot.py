@@ -1,6 +1,7 @@
 """
 Jobot — Agente intelligente per la ricerca di lavoro
-Bot Telegram (@gg_job_bot) + Groq + SQLite locale
+Bot Telegram (@gg_job_bot) + Groq + Supabase (PostgreSQL)
+Webhook mode per Google Cloud Run; polling per sviluppo locale.
 """
 
 import os
@@ -8,11 +9,11 @@ import io
 import re
 import json
 import logging
-import sqlite3
 import asyncio
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
+import asyncpg
 from groq import Groq
 from pypdf import PdfReader
 from job_search import (
@@ -35,13 +36,16 @@ from telegram.ext import (
 # Configurazione
 # ---------------------------------------------------------------------------
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-JOOBLE_API_KEY = os.environ.get("JOOBLE_API_KEY", "")
-ADZUNA_APP_ID  = os.environ.get("ADZUNA_APP_ID", "")
-ADZUNA_APP_KEY = os.environ.get("ADZUNA_APP_KEY", "")
-DB_PATH = "jobs.db"
-GROQ_MODEL = "qwen/qwen3.8-27b"
+TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
+GROQ_API_KEY    = os.environ["GROQ_API_KEY"]
+DATABASE_URL    = os.environ["DATABASE_URL"]
+JOOBLE_API_KEY  = os.environ.get("JOOBLE_API_KEY", "")
+ADZUNA_APP_ID   = os.environ.get("ADZUNA_APP_ID", "")
+ADZUNA_APP_KEY  = os.environ.get("ADZUNA_APP_KEY", "")
+WEBHOOK_URL     = os.environ.get("WEBHOOK_URL", "")   # https://your-cloud-run-url (senza slash finale)
+PORT            = int(os.environ.get("PORT", "8080"))
+
+GROQ_MODEL      = "qwen/qwen3.8-27b"
 CACHE_TTL_HOURS = 4
 
 logging.basicConfig(
@@ -53,29 +57,43 @@ log = logging.getLogger(__name__)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 # ---------------------------------------------------------------------------
-# Database
+# Database — asyncpg pool
 # ---------------------------------------------------------------------------
 
-def init_db() -> None:
-    with sqlite3.connect(DB_PATH) as con:
-        con.executescript("""
+_pool: asyncpg.Pool | None = None
+
+
+async def get_pool() -> asyncpg.Pool:
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+    return _pool
+
+
+async def init_db() -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                telegram_id  INTEGER PRIMARY KEY,
-                cv_text      TEXT NOT NULL,
-                current_ral  INTEGER DEFAULT 0,
-                current_role TEXT DEFAULT '',
-                goal         TEXT DEFAULT '',
-                updated_at   TEXT DEFAULT (datetime('now'))
+                telegram_id    BIGINT PRIMARY KEY,
+                cv_text        TEXT NOT NULL DEFAULT '',
+                current_ral    INTEGER DEFAULT 0,
+                user_role      TEXT DEFAULT '',
+                goal           TEXT DEFAULT '',
+                linkedin_email TEXT DEFAULT '',
+                linkedin_pw    TEXT DEFAULT '',
+                alert_days     INTEGER DEFAULT 0,
+                alert_last     TEXT DEFAULT '',
+                updated_at     TIMESTAMPTZ DEFAULT NOW()
             );
 
             CREATE TABLE IF NOT EXISTS searches (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id INTEGER NOT NULL,
+                id          BIGSERIAL PRIMARY KEY,
+                telegram_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
                 role        TEXT NOT NULL,
-                ral         TEXT,
-                mode        TEXT,
-                created_at  TEXT DEFAULT (datetime('now')),
-                FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
+                ral         TEXT DEFAULT '',
+                mode        TEXT DEFAULT '',
+                created_at  TIMESTAMPTZ DEFAULT NOW()
             );
 
             CREATE TABLE IF NOT EXISTS search_cache (
@@ -83,74 +101,65 @@ def init_db() -> None:
                 role        TEXT NOT NULL,
                 location    TEXT NOT NULL,
                 offers_json TEXT NOT NULL,
-                created_at  TEXT DEFAULT (datetime('now'))
+                created_at  TIMESTAMPTZ DEFAULT NOW()
             );
         """)
-        for col, definition in [
-            ("current_ral",   "INTEGER DEFAULT 0"),
-            ("current_role",  "TEXT DEFAULT ''"),
-            ("goal",          "TEXT DEFAULT ''"),
-            ("linkedin_email","TEXT DEFAULT ''"),
-            ("linkedin_pw",   "TEXT DEFAULT ''"),
-            ("alert_days",    "INTEGER DEFAULT 0"),
-            ("alert_last",    "TEXT DEFAULT ''"),
-        ]:
-            try:
-                con.execute(f"ALTER TABLE users ADD COLUMN {col} {definition}")
-            except sqlite3.OperationalError:
-                pass
+    log.info("Database inizializzato")
 
 
-def save_cv(telegram_id: int, cv_text: str) -> None:
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute("""
-            INSERT INTO users (telegram_id, cv_text)
-            VALUES (?, ?)
-            ON CONFLICT(telegram_id) DO UPDATE SET
-                cv_text    = excluded.cv_text,
-                updated_at = datetime('now')
-        """, (telegram_id, cv_text))
+async def _ensure_user(conn: asyncpg.Connection, telegram_id: int) -> None:
+    await conn.execute("""
+        INSERT INTO users (telegram_id, cv_text) VALUES ($1, '')
+        ON CONFLICT (telegram_id) DO NOTHING
+    """, telegram_id)
 
 
-def get_cv(telegram_id: int) -> str | None:
-    with sqlite3.connect(DB_PATH) as con:
-        row = con.execute(
-            "SELECT cv_text FROM users WHERE telegram_id = ?", (telegram_id,)
-        ).fetchone()
-    return row[0] if row else None
+async def save_cv(telegram_id: int, cv_text: str) -> None:
+    pool = await get_pool()
+    await pool.execute("""
+        INSERT INTO users (telegram_id, cv_text)
+        VALUES ($1, $2)
+        ON CONFLICT (telegram_id) DO UPDATE SET
+            cv_text    = EXCLUDED.cv_text,
+            updated_at = NOW()
+    """, telegram_id, cv_text)
 
 
-def save_search(telegram_id: int, role: str, ral: str, mode: str) -> None:
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute(
-            "INSERT INTO searches (telegram_id, role, ral, mode) VALUES (?, ?, ?, ?)",
-            (telegram_id, role, ral, mode),
+async def get_cv(telegram_id: int) -> str | None:
+    pool = await get_pool()
+    val = await pool.fetchval(
+        "SELECT cv_text FROM users WHERE telegram_id = $1", telegram_id
+    )
+    return val or None
+
+
+async def save_search(telegram_id: int, role: str, ral: str, mode: str) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await _ensure_user(conn, telegram_id)
+        await conn.execute(
+            "INSERT INTO searches (telegram_id, role, ral, mode) VALUES ($1, $2, $3, $4)",
+            telegram_id, role, ral, mode,
         )
 
 
-def get_searches(telegram_id: int) -> list[tuple]:
-    with sqlite3.connect(DB_PATH) as con:
-        return con.execute(
-            "SELECT role, ral, mode, created_at FROM searches WHERE telegram_id = ? ORDER BY created_at DESC",
-            (telegram_id,),
-        ).fetchall()
+async def get_searches(telegram_id: int) -> list[tuple]:
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT role, ral, mode, created_at FROM searches "
+        "WHERE telegram_id = $1 ORDER BY created_at DESC",
+        telegram_id,
+    )
+    return [(r["role"], r["ral"] or "", r["mode"] or "", str(r["created_at"])) for r in rows]
 
 
-def save_ral(telegram_id: int, ral: int) -> None:
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute(
-            "UPDATE users SET current_ral = ?, updated_at = datetime('now') WHERE telegram_id = ?",
-            (ral, telegram_id),
-        )
-
-
-def get_user_profile(telegram_id: int) -> dict:
-    with sqlite3.connect(DB_PATH) as con:
-        row = con.execute(
-            "SELECT current_ral, current_role, goal, linkedin_email, linkedin_pw, alert_days, alert_last "
-            "FROM users WHERE telegram_id = ?",
-            (telegram_id,),
-        ).fetchone()
+async def get_user_profile(telegram_id: int) -> dict:
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT current_ral, user_role, goal, linkedin_email, linkedin_pw, alert_days, alert_last "
+        "FROM users WHERE telegram_id = $1",
+        telegram_id,
+    )
     if not row:
         return {
             "ral": 0, "role": "", "goal": "",
@@ -158,41 +167,87 @@ def get_user_profile(telegram_id: int) -> dict:
             "alert_days": 0, "alert_last": "",
         }
     return {
-        "ral": row[0] or 0,
-        "role": row[1] or "",
-        "goal": row[2] or "",
-        "linkedin_email": row[3] or "",
-        "linkedin_pw": row[4] or "",
-        "alert_days": row[5] or 0,
-        "alert_last": row[6] or "",
+        "ral": row["current_ral"] or 0,
+        "role": row["user_role"] or "",
+        "goal": row["goal"] or "",
+        "linkedin_email": row["linkedin_email"] or "",
+        "linkedin_pw": row["linkedin_pw"] or "",
+        "alert_days": row["alert_days"] or 0,
+        "alert_last": row["alert_last"] or "",
     }
 
 
-def save_linkedin_creds(telegram_id: int, email: str, pw: str) -> None:
-    update_profile(telegram_id, linkedin_email=email, linkedin_pw=pw)
-
-
-def get_user_ral(telegram_id: int) -> int:
-    return get_user_profile(telegram_id)["ral"]
-
-
-def update_profile(telegram_id: int, **fields) -> None:
+async def update_profile(telegram_id: int, **fields) -> None:
     allowed = {
-        "current_ral", "current_role", "goal",
-        "linkedin_email", "linkedin_pw",
-        "alert_days", "alert_last",
+        "current_ral", "user_role", "goal",
+        "linkedin_email", "linkedin_pw", "alert_days", "alert_last",
     }
     cols = {k: v for k, v in fields.items() if k in allowed}
     if not cols:
         return
-    set_clause = ", ".join(f"{k} = ?" for k in cols)
-    values = list(cols.values()) + [telegram_id]
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute(
-            f"UPDATE users SET {set_clause}, updated_at = datetime('now') WHERE telegram_id = ?",
-            values,
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await _ensure_user(conn, telegram_id)
+        keys = list(cols.keys())
+        vals = list(cols.values())
+        set_clause = ", ".join(f"{k} = ${i + 1}" for i, k in enumerate(keys))
+        await conn.execute(
+            f"UPDATE users SET {set_clause}, updated_at = NOW() WHERE telegram_id = ${len(keys) + 1}",
+            *vals, telegram_id,
         )
 
+
+async def save_linkedin_creds(telegram_id: int, email: str, pw: str) -> None:
+    await update_profile(telegram_id, linkedin_email=email, linkedin_pw=pw)
+
+
+async def delete_user_data(telegram_id: int) -> None:
+    pool = await get_pool()
+    await pool.execute("DELETE FROM users WHERE telegram_id = $1", telegram_id)
+
+
+# ---------------------------------------------------------------------------
+# Cache offerte
+# ---------------------------------------------------------------------------
+
+def _cache_key(role: str, location: str) -> str:
+    return hashlib.md5(f"{role.lower().strip()}|{location.lower().strip()}".encode()).hexdigest()
+
+
+async def get_cached_offers(role: str, location: str) -> list[dict] | None:
+    key = _cache_key(role, location)
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT offers_json, created_at FROM search_cache WHERE cache_key = $1", key
+    )
+    if not row:
+        return None
+    try:
+        created = row["created_at"]
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if datetime.now(tz=timezone.utc) - created > timedelta(hours=CACHE_TTL_HOURS):
+            return None
+        return json.loads(row["offers_json"])
+    except Exception:
+        return None
+
+
+async def set_cached_offers(role: str, location: str, offers: list[dict]) -> None:
+    key = _cache_key(role, location)
+    pool = await get_pool()
+    await pool.execute("""
+        INSERT INTO search_cache (cache_key, role, location, offers_json)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (cache_key) DO UPDATE SET
+            offers_json = EXCLUDED.offers_json,
+            created_at  = NOW()
+    """, key, role, location, json.dumps(offers))
+
+
+# ---------------------------------------------------------------------------
+# Helpers RAL
+# ---------------------------------------------------------------------------
 
 def parse_ral(text: str) -> int:
     t = text.strip().lower()
@@ -208,51 +263,8 @@ def parse_ral(text: str) -> int:
     return val if 10_000 <= val <= 500_000 else 0
 
 
-def delete_user_data(telegram_id: int) -> None:
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute("DELETE FROM searches WHERE telegram_id = ?", (telegram_id,))
-        con.execute("DELETE FROM users WHERE telegram_id = ?", (telegram_id,))
-
-
 # ---------------------------------------------------------------------------
-# Cache offerte
-# ---------------------------------------------------------------------------
-
-def _cache_key(role: str, location: str) -> str:
-    return hashlib.md5(f"{role.lower().strip()}|{location.lower().strip()}".encode()).hexdigest()
-
-
-def get_cached_offers(role: str, location: str) -> list[dict] | None:
-    key = _cache_key(role, location)
-    with sqlite3.connect(DB_PATH) as con:
-        row = con.execute(
-            "SELECT offers_json, created_at FROM search_cache WHERE cache_key = ?", (key,)
-        ).fetchone()
-    if not row:
-        return None
-    try:
-        created = datetime.fromisoformat(row[1])
-        if datetime.now() - created > timedelta(hours=CACHE_TTL_HOURS):
-            return None
-        return json.loads(row[0])
-    except Exception:
-        return None
-
-
-def set_cached_offers(role: str, location: str, offers: list[dict]) -> None:
-    key = _cache_key(role, location)
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute("""
-            INSERT INTO search_cache (cache_key, role, location, offers_json, created_at)
-            VALUES (?, ?, ?, ?, datetime('now'))
-            ON CONFLICT(cache_key) DO UPDATE SET
-                offers_json = excluded.offers_json,
-                created_at  = datetime('now')
-        """, (key, role, location, json.dumps(offers)))
-
-
-# ---------------------------------------------------------------------------
-# Helpers Groq
+# Helpers Groq (sync — chiamati via asyncio.to_thread)
 # ---------------------------------------------------------------------------
 
 def _call_groq(system: str, user: str, max_tokens: int = 512) -> str:
@@ -285,8 +297,7 @@ def suggest_searches(cv_text: str, profile: dict | None = None) -> str:
         "1. Ruolo: … | RAL: …€ | Modalità: …\n"
         "2. …\n3. …\nNessun testo aggiuntivo."
     )
-    user = f"{ctx}CV (estratto):\n{cv_text[:3000]}"
-    return _call_groq(system, user, max_tokens=256)
+    return _call_groq(system, f"{ctx}CV (estratto):\n{cv_text[:3000]}", max_tokens=256)
 
 
 def _parse_score(score_str: str) -> int:
@@ -306,8 +317,7 @@ def quick_analyze_offer(cv_text: str, offer_text: str, current_ral: int = 0) -> 
         'separati da \\n"}\n'
         "ral_min e ral_max sono interi in €. Stimali dal mercato italiano se non indicati."
     )
-    user = f"{ral_ctx}CV:\n{cv_text[:1400]}\n\nOFFERTA:\n{offer_text[:1400]}"
-    raw = _call_groq(system, user, max_tokens=320)
+    raw = _call_groq(system, f"{ral_ctx}CV:\n{cv_text[:1400]}\n\nOFFERTA:\n{offer_text[:1400]}", max_tokens=320)
     try:
         start = raw.index("{")
         end = raw.rindex("}") + 1
@@ -335,11 +345,9 @@ def generate_market_report(profile: dict, num_offers: int, ral_values: list[int]
     current_ral = profile.get("ral", 0)
     role = profile.get("role", "")
     goal = profile.get("goal", "")
-
     avg_ral = int(sum(ral_values) / len(ral_values)) if ral_values else 0
     ral_min_market = min(ral_values) if ral_values else 0
     ral_max_market = max(ral_values) if ral_values else 0
-
     ctx = (
         f"Ruolo analizzato: {role}\n"
         f"RAL attuale candidato: {current_ral:,}€/anno\n".replace(",", ".")
@@ -353,7 +361,6 @@ def generate_market_report(profile: dict, num_offers: int, ral_values: list[int]
     ctx += f"Offerte attive trovate: {num_offers}\n"
     if goal:
         ctx += f"Obiettivo candidato: {goal}\n"
-
     system = (
         "Sei un career strategist. Analizza la posizione di mercato del candidato "
         "e dai una raccomandazione chiara. Rispondi SOLO con JSON valido:\n"
@@ -412,44 +419,41 @@ def _schedule_alert(job_queue, telegram_id: int, days: int) -> None:
 
 
 async def _send_alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    data = context.job.data
-    telegram_id = data["telegram_id"]
+    telegram_id = context.job.data["telegram_id"]
     try:
-        profile = get_user_profile(telegram_id)
-        searches = get_searches(telegram_id)
-        cv_text = get_cv(telegram_id)
+        profile  = await get_user_profile(telegram_id)
+        searches = await get_searches(telegram_id)
+        cv_text  = await get_cv(telegram_id)
 
         if not searches or not cv_text:
             return
 
-        loop = asyncio.get_event_loop()
         all_offers: list[dict] = []
 
         for role, _ral, mode, _ in searches[:3]:
             loc = "" if "remoto" in mode.lower() else "Italia"
 
-            # Cache first
-            cached = get_cached_offers(role, loc)
+            cached = await get_cached_offers(role, loc)
             if cached is not None:
                 all_offers.extend(cached[:5])
                 log.info("Alert: cache hit per '%s'", role)
                 continue
 
             results = await asyncio.gather(
-                loop.run_in_executor(None, fetch_indeed,          role, loc),
-                loop.run_in_executor(None, fetch_infojobs,        role),
-                loop.run_in_executor(None, fetch_jooble,          role, loc, JOOBLE_API_KEY),
-                loop.run_in_executor(None, fetch_remoteok,        role),
-                loop.run_in_executor(None, fetch_adzuna,          role, loc, ADZUNA_APP_ID, ADZUNA_APP_KEY),
-                loop.run_in_executor(None, fetch_talent,          role, loc or "Italy"),
-                loop.run_in_executor(None, fetch_remotive,        role),
-                loop.run_in_executor(None, fetch_weworkremotely,  role),
-                loop.run_in_executor(None, fetch_monster,         role),
-                loop.run_in_executor(None, fetch_linkedin, role, loc,
-                                     profile.get("linkedin_email", ""), profile.get("linkedin_pw", "")),
+                asyncio.to_thread(fetch_indeed,         role, loc),
+                asyncio.to_thread(fetch_infojobs,       role),
+                asyncio.to_thread(fetch_jooble,         role, loc, JOOBLE_API_KEY),
+                asyncio.to_thread(fetch_remoteok,       role),
+                asyncio.to_thread(fetch_adzuna,         role, loc, ADZUNA_APP_ID, ADZUNA_APP_KEY),
+                asyncio.to_thread(fetch_talent,         role, loc or "Italy"),
+                asyncio.to_thread(fetch_remotive,       role),
+                asyncio.to_thread(fetch_weworkremotely, role),
+                asyncio.to_thread(fetch_monster,        role),
+                asyncio.to_thread(fetch_linkedin, role, loc,
+                                  profile.get("linkedin_email", ""), profile.get("linkedin_pw", "")),
             )
             batch_offers = [o for sub in results for o in sub]
-            set_cached_offers(role, loc, batch_offers)
+            await set_cached_offers(role, loc, batch_offers)
             all_offers.extend(batch_offers[:5])
 
         all_offers = deduplicate(all_offers)[:8]
@@ -466,9 +470,7 @@ async def _send_alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"Descrizione: {offer.get('description', '')}"
             )
             async with sem:
-                return await loop.run_in_executor(
-                    None, quick_analyze_offer, cv_text, offer_text, current_ral
-                )
+                return await asyncio.to_thread(quick_analyze_offer, cv_text, offer_text, current_ral)
 
         to_analyze = min(5, len(all_offers))
         analyses = await asyncio.gather(*[analyze_one(o) for o in all_offers[:to_analyze]])
@@ -511,7 +513,7 @@ async def _send_alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 disable_web_page_preview=True,
             )
 
-        update_profile(telegram_id, alert_last=datetime.now().isoformat())
+        await update_profile(telegram_id, alert_last=datetime.now(tz=timezone.utc).isoformat())
         log.info("Alert inviato a %d: %d offerte", telegram_id, len(top))
 
     except Exception as e:
@@ -519,13 +521,13 @@ async def _send_alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def _restore_alert_jobs(app: Application) -> None:
-    with sqlite3.connect(DB_PATH) as con:
-        rows = con.execute(
-            "SELECT telegram_id, alert_days FROM users WHERE alert_days > 0"
-        ).fetchall()
-    for telegram_id, days in rows:
-        _schedule_alert(app.job_queue, telegram_id, days)
-        log.info("Alert ripristinato per utente %d (%d giorni)", telegram_id, days)
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT telegram_id, alert_days FROM users WHERE alert_days > 0"
+    )
+    for row in rows:
+        _schedule_alert(app.job_queue, row["telegram_id"], row["alert_days"])
+        log.info("Alert ripristinato per utente %d (%d giorni)", row["telegram_id"], row["alert_days"])
 
 
 # ---------------------------------------------------------------------------
@@ -568,9 +570,7 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         pdf_bytes = await file.download_as_bytearray()
 
         reader = PdfReader(io.BytesIO(bytes(pdf_bytes)))
-        cv_text = "\n".join(
-            page.extract_text() or "" for page in reader.pages
-        ).strip()
+        cv_text = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
 
         if not cv_text:
             await update.message.reply_text(
@@ -579,7 +579,7 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             )
             return
 
-        save_cv(telegram_id, cv_text)
+        await save_cv(telegram_id, cv_text)
         log.info("CV salvato per utente %d (%d caratteri)", telegram_id, len(cv_text))
 
         context.user_data["awaiting_ral"] = True
@@ -610,12 +610,12 @@ async def cmd_salva(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     role = parts[0]
-    ral = parts[1] if len(parts) > 1 else ""
+    ral  = parts[1] if len(parts) > 1 else ""
     mode = parts[2] if len(parts) > 2 else ""
 
-    save_search(telegram_id, role, ral, mode)
+    await save_search(telegram_id, role, ral, mode)
 
-    rows = get_searches(telegram_id)
+    rows = await get_searches(telegram_id)
     lista = "\n".join(f"• {r[0]} | {r[1]} | {r[2]}" for r in rows)
     await update.message.reply_text(
         f"✅ Ricerca salvata!\n\n<b>Le tue ricerche:</b>\n{lista}",
@@ -625,7 +625,7 @@ async def cmd_salva(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_ricerche(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     telegram_id = update.effective_user.id
-    rows = get_searches(telegram_id)
+    rows = await get_searches(telegram_id)
 
     if not rows:
         await update.message.reply_text(
@@ -644,8 +644,8 @@ async def cmd_ricerche(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     telegram_id = update.effective_user.id
-    cv_exists = get_cv(telegram_id) is not None
-    searches = get_searches(telegram_id)
+    cv_exists = await get_cv(telegram_id) is not None
+    searches  = await get_searches(telegram_id)
 
     if not cv_exists and not searches:
         await update.message.reply_text("Non ho dati da cancellare per te.")
@@ -667,9 +667,9 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_profilo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     telegram_id = update.effective_user.id
-    cv_text = get_cv(telegram_id)
-    profile = get_user_profile(telegram_id)
-    searches = get_searches(telegram_id)
+    cv_text  = await get_cv(telegram_id)
+    profile  = await get_user_profile(telegram_id)
+    searches = await get_searches(telegram_id)
 
     cv_status   = "✅ caricato" if cv_text else "❌ non caricato"
     ral_status  = f"{profile['ral']:,}€/anno".replace(",", ".") if profile["ral"] else "non impostata"
@@ -697,14 +697,14 @@ async def cmd_profilo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def cmd_aggiorna(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     telegram_id = update.effective_user.id
 
-    if not get_cv(telegram_id):
+    if not await get_cv(telegram_id):
         await update.message.reply_text("Carica prima il tuo CV in PDF!")
         return
 
     args = context.args
     if not args:
         context.user_data["aggiorna_step"] = "ral"
-        profile = get_user_profile(telegram_id)
+        profile = await get_user_profile(telegram_id)
         ral_str = f"{profile['ral']:,}€/anno".replace(",", ".") if profile["ral"] else "non impostata"
         await update.message.reply_text(
             f"🔄 <b>Aggiorna il tuo profilo</b>\n\n"
@@ -716,7 +716,7 @@ async def cmd_aggiorna(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    sub = args[0].lower()
+    sub   = args[0].lower()
     value = " ".join(args[1:]).strip()
 
     if sub == "ral":
@@ -724,21 +724,21 @@ async def cmd_aggiorna(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if not ral:
             await update.message.reply_text("RAL non valida. Es: /aggiorna ral 45000")
             return
-        update_profile(telegram_id, current_ral=ral)
+        await update_profile(telegram_id, current_ral=ral)
         await update.message.reply_text(f"✅ RAL aggiornata: {ral:,}€/anno".replace(",", "."))
 
     elif sub == "ruolo":
         if not value:
             await update.message.reply_text("Specifica il ruolo. Es: /aggiorna ruolo Senior Developer")
             return
-        update_profile(telegram_id, current_role=value)
+        await update_profile(telegram_id, user_role=value)
         await update.message.reply_text(f"✅ Ruolo aggiornato: {value}")
 
     elif sub == "obiettivo":
         if not value:
             await update.message.reply_text("Specifica l'obiettivo. Es: /aggiorna obiettivo aumentare RAL del 20%")
             return
-        update_profile(telegram_id, goal=value)
+        await update_profile(telegram_id, goal=value)
         await update.message.reply_text(f"✅ Obiettivo aggiornato: {value}")
 
     else:
@@ -752,12 +752,12 @@ async def cmd_aggiorna(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cmd_cerca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     telegram_id = update.effective_user.id
 
-    cv_text = get_cv(telegram_id)
+    cv_text = await get_cv(telegram_id)
     if not cv_text:
         await update.message.reply_text("Carica prima il tuo CV in PDF!")
         return
 
-    profile = get_user_profile(telegram_id)
+    profile     = await get_user_profile(telegram_id)
     current_ral = profile["ral"]
 
     if not current_ral:
@@ -771,7 +771,7 @@ async def cmd_cerca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    searches = get_searches(telegram_id)
+    searches = await get_searches(telegram_id)
     if not searches:
         await update.message.reply_text(
             "Non hai ricerche salvate.\n"
@@ -785,19 +785,15 @@ async def cmd_cerca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Adzuna", "Talent.com", "Remotive", "WeWorkRemotely",
         "Monster", "LinkedIn",
     ]
-    counts = {s: 0 for s in sources}
+    counts     = {s: 0 for s in sources}
     all_offers: list[dict] = []
 
-    await update.message.reply_text(
-        f"🔍 Cerco su {len(sources)} piattaforme in parallelo…"
-    )
+    await update.message.reply_text(f"🔍 Cerco su {len(sources)} piattaforme in parallelo…")
 
-    loop = asyncio.get_event_loop()
     for role, _ral, mode, _ in searches[:3]:
         loc = "" if "remoto" in mode.lower() else "Italia"
 
-        # Cache hit
-        cached = get_cached_offers(role, loc)
+        cached = await get_cached_offers(role, loc)
         if cached is not None:
             log.info("Cache hit per '%s' in '%s'", role, loc)
             for offer in cached[:5]:
@@ -808,27 +804,27 @@ async def cmd_cerca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
 
         results = await asyncio.gather(
-            loop.run_in_executor(None, fetch_indeed,          role, loc),
-            loop.run_in_executor(None, fetch_infojobs,        role),
-            loop.run_in_executor(None, fetch_jooble,          role, loc, JOOBLE_API_KEY),
-            loop.run_in_executor(None, fetch_remoteok,        role),
-            loop.run_in_executor(None, fetch_adzuna,          role, loc, ADZUNA_APP_ID, ADZUNA_APP_KEY),
-            loop.run_in_executor(None, fetch_talent,          role, loc or "Italy"),
-            loop.run_in_executor(None, fetch_remotive,        role),
-            loop.run_in_executor(None, fetch_weworkremotely,  role),
-            loop.run_in_executor(None, fetch_monster,         role),
-            loop.run_in_executor(None, fetch_linkedin, role, loc,
-                                 profile.get("linkedin_email", ""), profile.get("linkedin_pw", "")),
+            asyncio.to_thread(fetch_indeed,         role, loc),
+            asyncio.to_thread(fetch_infojobs,       role),
+            asyncio.to_thread(fetch_jooble,         role, loc, JOOBLE_API_KEY),
+            asyncio.to_thread(fetch_remoteok,       role),
+            asyncio.to_thread(fetch_adzuna,         role, loc, ADZUNA_APP_ID, ADZUNA_APP_KEY),
+            asyncio.to_thread(fetch_talent,         role, loc or "Italy"),
+            asyncio.to_thread(fetch_remotive,       role),
+            asyncio.to_thread(fetch_weworkremotely, role),
+            asyncio.to_thread(fetch_monster,        role),
+            asyncio.to_thread(fetch_linkedin, role, loc,
+                              profile.get("linkedin_email", ""), profile.get("linkedin_pw", "")),
         )
         batch_all = []
         for source, batch in zip(sources, results):
             counts[source] += len(batch)
             all_offers.extend(batch[:5])
             batch_all.extend(batch)
-        set_cached_offers(role, loc, batch_all)
+        await set_cached_offers(role, loc, batch_all)
 
     all_offers = deduplicate(all_offers)[:12]
-    total = sum(counts.values())
+    total      = sum(counts.values())
     to_analyze = min(5, len(all_offers))
 
     active = [f"• {s}: <b>{counts[s]}</b>" for s in sources if counts[s] > 0]
@@ -837,13 +833,13 @@ async def cmd_cerca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if empty:
         report += f"\n• Nessun risultato: <i>{', '.join(empty)}</i>"
 
-    sources_report = (
+    await update.message.reply_text(
         f"📊 <b>Risultati ricerca:</b>\n{report}\n"
         f"─────────────────\n"
         f"• Totale trovate: <b>{total}</b> ({len(all_offers)} uniche)\n"
-        f"• Analizzate con AI: <b>{to_analyze}</b>"
+        f"• Analizzate con AI: <b>{to_analyze}</b>",
+        parse_mode="HTML",
     )
-    await update.message.reply_text(sources_report, parse_mode="HTML")
 
     if not all_offers:
         await update.message.reply_text(
@@ -851,13 +847,10 @@ async def cmd_cerca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    to_analyze = min(8, len(all_offers))
-    progress_msg = await update.message.reply_text(
-        f"⚙️ Analizzo {to_analyze} offerte con AI… 0/{to_analyze}"
-    )
-
-    sem = asyncio.Semaphore(3)
-    completed = [0]
+    to_analyze    = min(8, len(all_offers))
+    progress_msg  = await update.message.reply_text(f"⚙️ Analizzo {to_analyze} offerte con AI… 0/{to_analyze}")
+    sem           = asyncio.Semaphore(3)
+    completed     = [0]
 
     async def analyze_one(offer: dict) -> dict:
         offer_text = (
@@ -866,9 +859,7 @@ async def cmd_cerca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Descrizione: {offer.get('description','')}"
         )
         async with sem:
-            result = await asyncio.get_event_loop().run_in_executor(
-                None, quick_analyze_offer, cv_text, offer_text, current_ral
-            )
+            result = await asyncio.to_thread(quick_analyze_offer, cv_text, offer_text, current_ral)
         completed[0] += 1
         try:
             await progress_msg.edit_text(
@@ -889,17 +880,17 @@ async def cmd_cerca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     lines = []
     for i, (offer, res) in enumerate(scored, 1):
-        url = offer.get("url", "")
-        score = res.get("score", "?")
-        company = offer.get("company", "")
-        source = offer.get("source", "")
+        url        = offer.get("url", "")
+        score      = res.get("score", "?")
+        company    = offer.get("company", "")
+        source     = offer.get("source", "")
         title_part = f'<a href="{url}">{offer["title"]}</a>' if url else offer["title"]
         company_part = f" — {company}" if company else ""
         lines.append(f'{i}. {title_part}{company_part} <i>[{source}]</i> 🎯{score}')
 
     BLOCK = 30
     for start in range(0, len(lines), BLOCK):
-        chunk = lines[start:start + BLOCK]
+        chunk  = lines[start:start + BLOCK]
         header = f"📋 <b>Tutte le offerte ({len(scored)})</b>\n\n" if start == 0 else ""
         await update.message.reply_text(
             header + "\n".join(chunk),
@@ -912,13 +903,13 @@ async def cmd_cerca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if top5:
         await update.message.reply_text(f"🏆 <b>Top {len(top5)} per il tuo profilo:</b>", parse_mode="HTML")
         for offer, res in top5:
-            url = offer.get("url", "")
+            url        = offer.get("url", "")
             ral_change = (
                 f"{res.get('ral_icon','📊')} <b>{res['ral_change']}</b> vs RAL attuale\n"
                 if "ral_change" in res else ""
             )
             motivazioni = res.get("motivazioni", "").strip()
-            mot_block = f"\n✅ <b>Perché fa per te:</b>\n{motivazioni}\n" if motivazioni else ""
+            mot_block   = f"\n✅ <b>Perché fa per te:</b>\n{motivazioni}\n" if motivazioni else ""
             msg = (
                 f"📌 <b>{offer['title']}</b>\n"
                 f"🏢 {offer.get('company','N/D')} — <i>{offer.get('source','')}</i>\n\n"
@@ -957,35 +948,34 @@ async def cmd_connetti(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    profile = get_user_profile(telegram_id)
-    status = f"Account attuale: <b>{profile['linkedin_email']}</b>\n\n" if profile.get("linkedin_email") else ""
+    profile = await get_user_profile(telegram_id)
+    status  = f"Account attuale: <b>{profile['linkedin_email']}</b>\n\n" if profile.get("linkedin_email") else ""
 
     context.user_data["connetti_step"] = "linkedin_email"
     await update.message.reply_text(
         f"🔗 <b>Collega LinkedIn</b>\n\n"
         f"{status}"
         "Scrivi la tua <b>email LinkedIn</b>:\n\n"
-        "<i>Le credenziali vengono salvate solo nel database locale del bot "
-        "e non vengono mai condivise o trasmesse a terzi.</i>",
+        "<i>Le credenziali vengono salvate solo nel database e non vengono mai condivise o trasmesse a terzi.</i>",
         parse_mode="HTML",
     )
 
 
 async def cmd_mercato(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     telegram_id = update.effective_user.id
-    profile = get_user_profile(telegram_id)
+    profile     = await get_user_profile(telegram_id)
 
-    if not profile["role"] and not get_cv(telegram_id):
+    if not profile["role"] and not await get_cv(telegram_id):
         await update.message.reply_text(
             "Carica prima il tuo CV e imposta il ruolo attuale con /aggiorna ruolo."
         )
         return
 
-    role = profile["role"] or "professionista"
+    role        = profile["role"] or "professionista"
     current_ral = profile["ral"]
 
     if not current_ral:
-        context.user_data["aggiorna_step"] = "ral"
+        context.user_data["aggiorna_step"]   = "ral"
         context.user_data["pending_mercato"] = True
         await update.message.reply_text(
             "💰 Per l'analisi di mercato ho bisogno della tua <b>RAL attuale</b>.\n\n"
@@ -994,20 +984,16 @@ async def cmd_mercato(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    await update.message.reply_text(
-        f"📡 Scansiono il mercato per <b>{role}</b>…",
-        parse_mode="HTML",
-    )
+    await update.message.reply_text(f"📡 Scansiono il mercato per <b>{role}</b>…", parse_mode="HTML")
 
-    loop = asyncio.get_event_loop()
     sources_results = await asyncio.gather(
-        loop.run_in_executor(None, fetch_jooble,   role, "Italia", JOOBLE_API_KEY),
-        loop.run_in_executor(None, fetch_adzuna,   role, "Italia", ADZUNA_APP_ID, ADZUNA_APP_KEY),
-        loop.run_in_executor(None, fetch_remotive, role),
-        loop.run_in_executor(None, fetch_talent,   role, "Italy"),
-        loop.run_in_executor(None, fetch_remoteok, role),
-        loop.run_in_executor(None, fetch_linkedin, role, "Italia",
-                             profile.get("linkedin_email", ""), profile.get("linkedin_pw", "")),
+        asyncio.to_thread(fetch_jooble,   role, "Italia", JOOBLE_API_KEY),
+        asyncio.to_thread(fetch_adzuna,   role, "Italia", ADZUNA_APP_ID, ADZUNA_APP_KEY),
+        asyncio.to_thread(fetch_remotive, role),
+        asyncio.to_thread(fetch_talent,   role, "Italy"),
+        asyncio.to_thread(fetch_remoteok, role),
+        asyncio.to_thread(fetch_linkedin, role, "Italia",
+                          profile.get("linkedin_email", ""), profile.get("linkedin_pw", "")),
     )
 
     all_offers = deduplicate([o for batch in sources_results for o in batch])
@@ -1020,21 +1006,19 @@ async def cmd_mercato(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    sample = all_offers[:6]
+    sample           = all_offers[:6]
     mercato_progress = await update.message.reply_text(
         f"🔢 Trovate <b>{num_offers}</b> offerte. Calcolo RAL di mercato… 0/{len(sample)}",
         parse_mode="HTML",
     )
 
-    sem_m = asyncio.Semaphore(3)
+    sem_m  = asyncio.Semaphore(3)
     done_m = [0]
 
     async def analyze_market_offer(offer: dict) -> dict:
         offer_text = f"Titolo: {offer['title']}\nDescrizione: {offer.get('description','')}"
         async with sem_m:
-            result = await loop.run_in_executor(
-                None, quick_analyze_offer, "", offer_text, 0
-            )
+            result = await asyncio.to_thread(quick_analyze_offer, "", offer_text, 0)
         done_m[0] += 1
         try:
             await mercato_progress.edit_text(
@@ -1056,10 +1040,7 @@ async def cmd_mercato(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             if ral_min > 0 and ral_max > 0:
                 ral_values.append(int((ral_min + ral_max) / 2))
 
-    report = await loop.run_in_executor(
-        None, generate_market_report, profile, num_offers, ral_values
-    )
-
+    report  = await asyncio.to_thread(generate_market_report, profile, num_offers, ral_values)
     avg_ral = int(sum(ral_values) / len(ral_values)) if ral_values else 0
     ral_min_m = min(ral_values) if ral_values else 0
     ral_max_m = max(ral_values) if ral_values else 0
@@ -1073,12 +1054,10 @@ async def cmd_mercato(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     domanda_emoji = {"alta": "🔥", "media": "📈", "bassa": "❄️"}.get(
         report.get("domanda", "").lower(), "📊"
     )
-
-    azioni = report.get("azioni", [])
+    azioni       = report.get("azioni", [])
     azioni_block = "\n".join(f"  • {a}" for a in azioni) if azioni else ""
-
-    segnale = report.get("segnale", "N/D")
-    emoji = report.get("emoji", "⚪")
+    segnale      = report.get("segnale", "N/D")
+    emoji        = report.get("emoji", "⚪")
 
     msg = (
         f"📊 <b>REPORT DI MERCATO — {role.upper()}</b>\n\n"
@@ -1097,14 +1076,13 @@ async def cmd_mercato(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Configura gli alert automatici con scelta della frequenza."""
     telegram_id = update.effective_user.id
 
-    if not get_cv(telegram_id):
+    if not await get_cv(telegram_id):
         await update.message.reply_text("Carica prima il tuo CV in PDF!")
         return
 
-    searches = get_searches(telegram_id)
+    searches = await get_searches(telegram_id)
     if not searches:
         await update.message.reply_text(
             "Non hai ricerche salvate.\n"
@@ -1113,19 +1091,19 @@ async def cmd_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    profile = get_user_profile(telegram_id)
-    days = profile.get("alert_days", 0)
-    label = {1: "ogni giorno", 3: "ogni 3 giorni", 7: "ogni settimana"}.get(days, "")
-    status = f"🔔 Attivo: <b>{label}</b>" if days else "🔕 <b>Disattivato</b>"
+    profile = await get_user_profile(telegram_id)
+    days    = profile.get("alert_days", 0)
+    label   = {1: "ogni giorno", 3: "ogni 3 giorni", 7: "ogni settimana"}.get(days, "")
+    status  = f"🔔 Attivo: <b>{label}</b>" if days else "🔕 <b>Disattivato</b>"
 
     keyboard = [
         [
-            InlineKeyboardButton("📅 Ogni giorno",     callback_data="alert_1"),
-            InlineKeyboardButton("📅 Ogni 3 giorni",   callback_data="alert_3"),
+            InlineKeyboardButton("📅 Ogni giorno",    callback_data="alert_1"),
+            InlineKeyboardButton("📅 Ogni 3 giorni",  callback_data="alert_3"),
         ],
         [
-            InlineKeyboardButton("📅 Ogni settimana",  callback_data="alert_7"),
-            InlineKeyboardButton("❌ Disattiva",        callback_data="alert_0"),
+            InlineKeyboardButton("📅 Ogni settimana", callback_data="alert_7"),
+            InlineKeyboardButton("❌ Disattiva",       callback_data="alert_0"),
         ],
     ]
     await update.message.reply_text(
@@ -1144,13 +1122,12 @@ async def callback_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer()
 
     telegram_id = update.effective_user.id
-    days = int(query.data.split("_")[1])
+    days        = int(query.data.split("_")[1])
 
-    # Rimuovi job esistenti
     for job in context.job_queue.get_jobs_by_name(f"alert_{telegram_id}"):
         job.schedule_removal()
 
-    update_profile(telegram_id, alert_days=days, alert_last="")
+    await update_profile(telegram_id, alert_days=days, alert_last="")
 
     if days > 0:
         _schedule_alert(context.job_queue, telegram_id, days)
@@ -1168,16 +1145,15 @@ async def callback_alert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def cmd_analisi_cv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Analisi approfondita del CV vs mercato del lavoro italiano con dati da osservatori."""
     telegram_id = update.effective_user.id
-    cv_text = get_cv(telegram_id)
+    cv_text     = await get_cv(telegram_id)
 
     if not cv_text:
         await update.message.reply_text("Carica prima il tuo CV in PDF!")
         return
 
-    profile = get_user_profile(telegram_id)
-    role = profile.get("role") or "professionista"
+    profile = await get_user_profile(telegram_id)
+    role    = profile.get("role") or "professionista"
 
     progress = await update.message.reply_text(
         f"🔬 <b>Analisi CV vs Mercato</b>\n\n"
@@ -1185,18 +1161,15 @@ async def cmd_analisi_cv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         parse_mode="HTML",
     )
 
-    loop = asyncio.get_event_loop()
-
-    # Fetch parallelo: offerte + insight mercato italiano
     (job_results, insights) = await asyncio.gather(
         asyncio.gather(
-            loop.run_in_executor(None, fetch_jooble,   role, "Italia", JOOBLE_API_KEY),
-            loop.run_in_executor(None, fetch_adzuna,   role, "Italia", ADZUNA_APP_ID, ADZUNA_APP_KEY),
-            loop.run_in_executor(None, fetch_remotive, role),
-            loop.run_in_executor(None, fetch_talent,   role, "Italy"),
-            loop.run_in_executor(None, fetch_remoteok, role),
+            asyncio.to_thread(fetch_jooble,   role, "Italia", JOOBLE_API_KEY),
+            asyncio.to_thread(fetch_adzuna,   role, "Italia", ADZUNA_APP_ID, ADZUNA_APP_KEY),
+            asyncio.to_thread(fetch_remotive, role),
+            asyncio.to_thread(fetch_talent,   role, "Italy"),
+            asyncio.to_thread(fetch_remoteok, role),
         ),
-        loop.run_in_executor(None, fetch_market_insights, role),
+        asyncio.to_thread(fetch_market_insights, role),
     )
 
     all_offers = deduplicate([o for batch in job_results for o in batch])[:10]
@@ -1244,12 +1217,12 @@ async def cmd_analisi_cv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"DATI OSSERVATORI ITALIANI (priorità alta per score e trend):\n{insights_text}"
     )
 
-    raw = await loop.run_in_executor(None, _call_groq, system, user_content, 700)
+    raw = await asyncio.to_thread(_call_groq, system, user_content, 700)
 
     try:
         start = raw.index("{")
-        end = raw.rindex("}") + 1
-        data = json.loads(raw[start:end])
+        end   = raw.rindex("}") + 1
+        data  = json.loads(raw[start:end])
     except Exception:
         data = {
             "score_mercato": "N/D", "score_spiegazione": "",
@@ -1273,7 +1246,6 @@ async def cmd_analisi_cv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     keywords_block = " · ".join(f"<code>{k}</code>" for k in keywords) if keywords else "N/D"
     azioni_block   = "\n".join(f"  {i+1}. {a}" for i, a in enumerate(azioni)) if azioni else "  N/D"
 
-    # Fonti osservatori con link
     sources_lines = []
     seen_sources: set[str] = set()
     for item in insights[:5]:
@@ -1306,26 +1278,24 @@ async def cmd_analisi_cv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     telegram_id = update.effective_user.id
-    offer_text = update.message.text.strip()
+    offer_text  = update.message.text.strip()
 
-    # Gestione RAL dopo upload CV
+    # RAL dopo upload CV
     if context.user_data.get("awaiting_ral"):
         context.user_data["awaiting_ral"] = False
         ral = parse_ral(offer_text)
         if ral > 0:
-            update_profile(telegram_id, current_ral=ral)
+            await update_profile(telegram_id, current_ral=ral)
             await update.message.reply_text(
                 f"✅ RAL attuale salvata: <b>{ral:,}€/anno</b>\n\nCalcolo i suggerimenti…".replace(",", "."),
                 parse_mode="HTML",
             )
         else:
             await update.message.reply_text("RAL non salvata. Calcolo i suggerimenti…")
-        cv_text = get_cv(telegram_id)
+        cv_text = await get_cv(telegram_id)
         if cv_text:
-            profile = get_user_profile(telegram_id)
-            suggestions = await asyncio.get_event_loop().run_in_executor(
-                None, suggest_searches, cv_text, profile
-            )
+            profile     = await get_user_profile(telegram_id)
+            suggestions = await asyncio.to_thread(suggest_searches, cv_text, profile)
             await update.message.reply_text(
                 f"🎯 <b>Suggerimenti di ricerca strategici:</b>\n\n{suggestions}\n\n"
                 "Usa <code>/salva Ruolo | RAL | Modalità</code> per registrarne una.",
@@ -1339,7 +1309,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         if step == "linkedin_email":
             context.user_data["linkedin_email_tmp"] = offer_text.strip()
-            context.user_data["connetti_step"] = "linkedin_pw"
+            context.user_data["connetti_step"]      = "linkedin_pw"
             await update.message.reply_text(
                 "🔑 Ora scrivi la tua <b>password LinkedIn</b>.\n\n"
                 "⚠️ <i>Il messaggio verrà eliminato subito dopo la lettura.</i>",
@@ -1350,13 +1320,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if step == "linkedin_pw":
             context.user_data.pop("connetti_step", None)
             email = context.user_data.pop("linkedin_email_tmp", "")
-            pw = offer_text.strip()
+            pw    = offer_text.strip()
             try:
                 await update.message.delete()
             except Exception:
                 pass
             if email and pw:
-                save_linkedin_creds(telegram_id, email, pw)
+                await save_linkedin_creds(telegram_id, email, pw)
                 await update.message.reply_text(
                     f"✅ LinkedIn collegato come <b>{email}</b>.\n"
                     "Il messaggio con la password è stato eliminato dalla chat.",
@@ -1368,15 +1338,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Flusso guidato /aggiorna
     if context.user_data.get("aggiorna_step"):
-        step = context.user_data.pop("aggiorna_step")
+        step          = context.user_data.pop("aggiorna_step")
         pending_cerca = context.user_data.pop("pending_cerca", False)
-        val = offer_text.strip()
+        val           = offer_text.strip()
 
         if step == "ral":
             if val.lower() != "skip":
                 ral = parse_ral(val)
                 if ral:
-                    update_profile(telegram_id, current_ral=ral)
+                    await update_profile(telegram_id, current_ral=ral)
                     await update.message.reply_text(
                         f"✅ RAL: <b>{ral:,}€/anno</b>".replace(",", "."), parse_mode="HTML"
                     )
@@ -1390,7 +1360,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await update.message.reply_text("Perfetto! Avvio l'analisi di mercato…")
                 await cmd_mercato(update, context)
                 return
-            profile = get_user_profile(telegram_id)
+            profile  = await get_user_profile(telegram_id)
             role_str = profile["role"] or "non impostato"
             context.user_data["aggiorna_step"] = "ruolo"
             await update.message.reply_text(
@@ -1401,9 +1371,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         elif step == "ruolo":
             if val.lower() != "skip" and val:
-                update_profile(telegram_id, current_role=val)
+                await update_profile(telegram_id, user_role=val)
                 await update.message.reply_text(f"✅ Ruolo: <b>{val}</b>", parse_mode="HTML")
-            profile = get_user_profile(telegram_id)
+            profile  = await get_user_profile(telegram_id)
             goal_str = profile["goal"] or "non impostato"
             context.user_data["aggiorna_step"] = "obiettivo"
             await update.message.reply_text(
@@ -1415,21 +1385,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         elif step == "obiettivo":
             if val.lower() != "skip" and val:
-                update_profile(telegram_id, goal=val)
+                await update_profile(telegram_id, goal=val)
                 await update.message.reply_text(f"✅ Obiettivo: <b>{val}</b>", parse_mode="HTML")
             await update.message.reply_text(
-                "🎉 Profilo aggiornato! Usa /profilo per vederlo o /cerca per trovare offerte.",
+                "🎉 Profilo aggiornato! Usa /profilo per vederlo o /cerca per trovare offerte."
             )
         return
 
-    # Gestione conferma reset
+    # Conferma reset
     if context.user_data.get("reset_pending"):
         context.user_data["reset_pending"] = False
         if offer_text.strip().upper() == "SI":
-            delete_user_data(telegram_id)
-            await update.message.reply_text(
-                "✅ Dati cancellati. Puoi inviare un nuovo CV quando vuoi."
-            )
+            await delete_user_data(telegram_id)
+            await update.message.reply_text("✅ Dati cancellati. Puoi inviare un nuovo CV quando vuoi.")
         else:
             await update.message.reply_text("Operazione annullata. I tuoi dati sono al sicuro.")
         return
@@ -1441,21 +1409,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    cv_text = get_cv(telegram_id)
+    cv_text = await get_cv(telegram_id)
     if not cv_text:
-        await update.message.reply_text(
-            "Non ho ancora il tuo CV. Inviamelo prima come PDF!"
-        )
+        await update.message.reply_text("Non ho ancora il tuo CV. Inviamelo prima come PDF!")
         return
 
     await update.message.reply_text("🔍 Analizzo l'offerta con il tuo CV…")
 
     try:
-        analysis = await asyncio.get_event_loop().run_in_executor(
-            None, analyze_offer, cv_text, offer_text
-        )
+        analysis = await asyncio.to_thread(analyze_offer, cv_text, offer_text)
         await update.message.reply_text(analysis, parse_mode="Markdown")
-
     except Exception as e:
         log.exception("Errore nell'analisi dell'offerta")
         await update.message.reply_text(f"Errore durante l'analisi: {e}")
@@ -1465,15 +1428,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    asyncio.set_event_loop(asyncio.new_event_loop())
-    init_db()
-    log.info("Database inizializzato: %s", DB_PATH)
+async def _post_init(app: Application) -> None:
+    await init_db()
+    await _restore_alert_jobs(app)
 
+
+def main() -> None:
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
-        .post_init(_restore_alert_jobs)
+        .post_init(_post_init)
         .build()
     )
 
@@ -1492,8 +1456,18 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    log.info("Jobot avviato — in ascolto su @gg_job_bot")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    if WEBHOOK_URL:
+        log.info("Jobot in modalità webhook — porta %d", PORT)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TELEGRAM_TOKEN,
+            webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}",
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        log.info("Jobot in modalità polling (locale)")
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
